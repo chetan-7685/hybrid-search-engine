@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hybrid Search</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="wrap">
+
+    <header class="topbar">
+      <div class="brand">
+        <svg class="lamp" width="22" height="22" viewBox="0 0 24 24" fill="none">
+          <path d="M12 2C8 2 5 5 5 9c0 3 2 5 4 6v2h6v-2c2-1 4-3 4-6 0-4-3-7-7-7Z" stroke="currentColor" stroke-width="1.4"/>
+          <path d="M9 20h6M10 22h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+        </svg>
+        <span>Hybrid Search</span>
+      </div>
+      <button id="history-btn" class="ghost-btn" title="Recent searches">Recent</button>
+    </header>
+
+    <section class="hero">
+      <h1>Two signals meet here.</h1>
+      <p class="lede">Keyword precision, blended with meaning — reranked live from real web results.</p>
+
+      <form id="search-form">
+        <input id="query" type="text" placeholder="Search anything… (press / to focus)" autocomplete="off" autofocus />
+        <button type="submit">Search</button>
+      </form>
+
+      <div class="chips" id="chips">
+        <span class="chip" data-q="what is photosynthesis">what is photosynthesis</span>
+        <span class="chip" data-q="best python web frameworks">best python web frameworks</span>
+        <span class="chip" data-q="how does bm25 ranking work">how does bm25 ranking work</span>
+        <span class="chip" data-q="climate change causes">climate change causes</span>
+      </div>
+
+      <div id="history-panel" class="history-panel hidden"></div>
+
+      <div class="fusion">
+        <svg id="beam-svg" viewBox="0 0 600 120" preserveAspectRatio="none">
+          <path id="beam-lex" d="M 0 30 C 220 30, 260 60, 300 60" />
+          <path id="beam-sem" d="M 600 90 C 380 90, 340 60, 300 60" />
+          <circle id="beam-dot" cx="300" cy="60" r="5" />
+        </svg>
+        <div class="fusion-labels">
+          <span class="lex-label">Keyword <span id="lex-pct">50%</span></span>
+          <input id="alpha" type="range" min="0" max="1" step="0.05" value="0.5" />
+          <span class="sem-label"><span id="sem-pct">50%</span> Semantic</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="results-area">
+      <div id="status" class="status"></div>
+      <div id="results"></div>
+    </section>
+
+  </div>
+
+<script>
+const form = document.getElementById('search-form');
+const queryInput = document.getElementById('query');
+const alphaInput = document.getElementById('alpha');
+const lexPct = document.getElementById('lex-pct');
+const semPct = document.getElementById('sem-pct');
+const beamLex = document.getElementById('beam-lex');
+const beamSem = document.getElementById('beam-sem');
+const beamDot = document.getElementById('beam-dot');
+const statusEl = document.getElementById('status');
+const resultsEl = document.getElementById('results');
+const historyBtn = document.getElementById('history-btn');
+const historyPanel = document.getElementById('history-panel');
+
+const HISTORY_KEY = 'hybrid_search_history';
+let lastAlpha = 0.5;
+
+function updateBeams(alpha) {
+  lexPct.textContent = Math.round((1 - alpha) * 100) + '%';
+  semPct.textContent = Math.round(alpha * 100) + '%';
+  beamLex.style.strokeWidth = (2 + (1 - alpha) * 10).toFixed(1);
+  beamSem.style.strokeWidth = (2 + alpha * 10).toFixed(1);
+  beamLex.style.opacity = 0.35 + (1 - alpha) * 0.65;
+  beamSem.style.opacity = 0.35 + alpha * 0.65;
+}
+updateBeams(0.5);
+alphaInput.addEventListener('input', () => updateBeams(parseFloat(alphaInput.value)));
+
+function pulseDot() {
+  beamDot.classList.remove('pulse');
+  void beamDot.offsetWidth; // restart animation
+  beamDot.classList.add('pulse');
+}
+
+function loadHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); }
+  catch { return []; }
+}
+function saveHistory(q) {
+  let h = loadHistory().filter(x => x !== q);
+  h.unshift(q);
+  h = h.slice(0, 8);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
+}
+function renderHistory() {
+  const h = loadHistory();
+  historyPanel.innerHTML = h.length
+    ? h.map(q => `<span class="chip" data-q="${q}">${q}</span>`).join('')
+    : '<span class="empty-hint">No searches yet.</span>';
+}
+historyBtn.addEventListener('click', () => {
+  renderHistory();
+  historyPanel.classList.toggle('hidden');
+});
+
+function skeletons(n) {
+  return Array.from({ length: n }, () => `
+    <div class="card skeleton">
+      <div class="rank"></div>
+      <div class="card-body">
+        <div class="sk-line w60"></div>
+        <div class="sk-line w40"></div>
+        <div class="sk-line w90"></div>
+        <div class="sk-line w70"></div>
+      </div>
+    </div>`).join('');
+}
+
+function renderResults(data) {
+  if (!data.results.length) {
+    resultsEl.innerHTML = `<div class="empty-state">No results found. Try a different phrasing.</div>`;
+    return;
+  }
+  resultsEl.innerHTML = data.results.map((r, i) => {
+    const dominant = r.bm25_score >= r.semantic_score ? 'lex' : 'sem';
+    const lexContrib = (1 - lastAlpha) * r.bm25_score;
+    const semContrib = lastAlpha * r.semantic_score;
+    return `
+    <div class="card tab-${dominant}">
+      <div class="rank">${String(i + 1).padStart(2, '0')}</div>
+      <div class="card-body">
+        <a class="title" href="${r.url}" target="_blank" rel="noopener">${r.title}</a>
+        <div class="url-row">
+          <span class="url">${r.url}</span>
+          <button class="copy-btn" data-url="${r.url}" title="Copy link">⧉</button>
+        </div>
+        <p class="snippet">${r.snippet}</p>
+        <div class="scores">
+          <span class="score-pill fused">fused ${r.score}</span>
+          <span class="score-pill lex">keyword ${r.bm25_score}</span>
+          <span class="score-pill sem">semantic ${r.semantic_score}</span>
+        </div>
+        <div class="bar-track"><div class="bar lex-bar" style="width:${r.bm25_score * 100}%"></div></div>
+        <div class="bar-track"><div class="bar sem-bar" style="width:${r.semantic_score * 100}%"></div></div>
+        <details class="why">
+          <summary>Why this ranked here</summary>
+          <div class="why-body">
+            <code>fused = ${lastAlpha.toFixed(2)} × semantic + ${(1 - lastAlpha).toFixed(2)} × keyword</code>
+            <code>= ${lastAlpha.toFixed(2)} × ${r.semantic_score} + ${(1 - lastAlpha).toFixed(2)} × ${r.bm25_score}</code>
+            <code>≈ ${(lexContrib + semContrib).toFixed(3)}</code>
+          </div>
+        </details>
+      </div>
+    </div>`;
+  }).join('');
+
+  resultsEl.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      navigator.clipboard.writeText(btn.dataset.url);
+      btn.textContent = '✓';
+      setTimeout(() => (btn.textContent = '⧉'), 1200);
+    });
+  });
+}
+
+async function runSearch(q) {
+  if (!q) return;
+  queryInput.value = q;
+  lastAlpha = parseFloat(alphaInput.value);
+  statusEl.textContent = 'Fetching web results and reranking…';
+  resultsEl.innerHTML = skeletons(4);
+  pulseDot();
+  saveHistory(q);
+
+  try {
+    const res = await fetch(`/search?q=${encodeURIComponent(q)}&alpha=${lastAlpha}`);
+    const data = await res.json();
+    if (data.error) {
+      statusEl.textContent = 'Error: ' + data.error;
+      resultsEl.innerHTML = '';
+      return;
+    }
+    statusEl.innerHTML = data.results.length
+      ? `${data.results.length} results for “${data.query}” <span class="backend-tag">· ${data.backend}</span>`
+      : `No results for “${data.query}”`;
+    renderResults(data);
+  } catch (err) {
+    statusEl.textContent = 'Request failed: ' + err;
+    resultsEl.innerHTML = '';
+  }
+}
+
+form.addEventListener('submit', (e) => {
+  e.preventDefault();
+  runSearch(queryInput.value.trim());
+});
+
+document.addEventListener('click', (e) => {
+  if (e.target.classList.contains('chip')) {
+    runSearch(e.target.dataset.q);
+    historyPanel.classList.add('hidden');
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === '/' && document.activeElement !== queryInput) {
+    e.preventDefault();
+    queryInput.focus();
+  }
+  if (e.key === 'Escape') {
+    queryInput.value = '';
+    historyPanel.classList.add('hidden');
+  }
+});
+</script>
+</body>
+</html>
